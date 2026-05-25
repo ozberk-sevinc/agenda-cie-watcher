@@ -4,6 +4,8 @@ Local Windows GUI watcher for the Italian `Agenda CIE` appointment flow, built w
 
 The watcher is intentionally limited to the protected `Scegli la sede` step of the official flow. You still complete login, CAPTCHA, and request details manually in Microsoft Edge. Once the table is visible, the app refreshes the page on a fixed interval, scans the currently rendered rows, and alerts when it finds a selectable appointment inside your chosen date range.
 
+![alt text](image.png)
+
 ## What It Does
 
 - Opens or attaches to a Microsoft Edge session with remote debugging enabled
