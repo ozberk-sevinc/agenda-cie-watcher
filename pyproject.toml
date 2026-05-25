@@ -9,7 +9,7 @@ description = "Local Selenium watcher for Agenda CIE appointment availability at
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "selenium>=4.44.0",
+  "selenium==4.44.0",
 ]
 
 [project.scripts]

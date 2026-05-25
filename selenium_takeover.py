@@ -1,7 +1,9 @@
 import datetime as dt
 import json
+import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -9,6 +11,7 @@ import time
 import tkinter as tk
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -19,11 +22,63 @@ from selenium.webdriver.edge.options import Options
 
 ROOT = Path(__file__).resolve().parent
 LOG_PATH = ROOT / "appointment_notifier.log"
-PROFILE_DIR = ROOT / "edge-profile-selenium"
 START_URL = "https://www.prenotazionicie.interno.gov.it/cittadino/a/sc/wizardAppuntamentoCittadino/sceltaSede"
-CHECK_INTERVAL_SECONDS = 60
-DEBUG_PORT = 9333
-EDGE_EXE = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
+DEFAULT_DEBUG_PORT = 9333
+DEFAULT_CHECK_INTERVAL_SECONDS = 60
+DEFAULT_PROFILE_DIR = ROOT / "edge-profile-selenium"
+DEFAULT_EDGE_PATHS = (
+    Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+    Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+)
+TARGET_PATH_FRAGMENT = "/wizardAppuntamentoCittadino/sceltaSede"
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    start_url: str = START_URL
+    debug_port: int = DEFAULT_DEBUG_PORT
+    check_interval_seconds: int = DEFAULT_CHECK_INTERVAL_SECONDS
+    profile_dir: Path = DEFAULT_PROFILE_DIR
+    edge_exe: Path | None = None
+
+    @classmethod
+    def load(cls):
+        edge_path = os.environ.get("AGENDA_CIE_EDGE_PATH", "").strip()
+        port_value = os.environ.get("AGENDA_CIE_DEBUG_PORT", "").strip()
+        interval_value = os.environ.get("AGENDA_CIE_CHECK_INTERVAL_SECONDS", "").strip()
+
+        return cls(
+            debug_port=parse_int_env(port_value, DEFAULT_DEBUG_PORT, "AGENDA_CIE_DEBUG_PORT"),
+            check_interval_seconds=parse_int_env(
+                interval_value,
+                DEFAULT_CHECK_INTERVAL_SECONDS,
+                "AGENDA_CIE_CHECK_INTERVAL_SECONDS",
+            ),
+            profile_dir=Path(os.environ.get("AGENDA_CIE_PROFILE_DIR", DEFAULT_PROFILE_DIR)),
+            edge_exe=Path(edge_path) if edge_path else discover_edge_executable(),
+        )
+
+
+def parse_int_env(value, default, name):
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer.") from exc
+    if parsed <= 0:
+        raise RuntimeError(f"{name} must be greater than zero.")
+    return parsed
+
+
+def discover_edge_executable():
+    edge_from_path = shutil.which("msedge")
+    if edge_from_path:
+        return Path(edge_from_path)
+    for candidate in DEFAULT_EDGE_PATHS:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def log(message):
@@ -108,48 +163,71 @@ def parse_italian_date(text):
         return None
 
 
-def is_debug_port_ready():
+def is_debug_port_ready(debug_port):
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{DEBUG_PORT}/json/version", timeout=2) as response:
+        with urllib.request.urlopen(f"http://127.0.0.1:{debug_port}/json/version", timeout=2) as response:
             json.loads(response.read().decode("utf-8"))
         return True
     except (OSError, urllib.error.URLError, json.JSONDecodeError):
         return False
 
 
-def launch_edge_for_attach():
-    if is_debug_port_ready():
-        return
-    if not EDGE_EXE.exists():
-        raise RuntimeError(f"Microsoft Edge not found at {EDGE_EXE}")
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.Popen(
-        [
-            str(EDGE_EXE),
-            f"--remote-debugging-port={DEBUG_PORT}",
-            f"--user-data-dir={PROFILE_DIR}",
-            "--no-first-run",
-            "--start-maximized",
-            START_URL,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    for _ in range(30):
-        if is_debug_port_ready():
+class EdgeSession:
+    def __init__(self, config):
+        self.config = config
+        self.driver = None
+
+    def ensure_debug_browser(self):
+        if is_debug_port_ready(self.config.debug_port):
             return
-        time.sleep(1)
-    raise RuntimeError("Edge did not open the remote debugging port.")
+        if not self.config.edge_exe:
+            raise RuntimeError(
+                "Microsoft Edge was not found automatically. "
+                "Set AGENDA_CIE_EDGE_PATH to the full msedge.exe path."
+            )
+
+        self.config.profile_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(
+            [
+                str(self.config.edge_exe),
+                f"--remote-debugging-port={self.config.debug_port}",
+                f"--user-data-dir={self.config.profile_dir}",
+                "--no-first-run",
+                "--start-maximized",
+                self.config.start_url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for _ in range(30):
+            if is_debug_port_ready(self.config.debug_port):
+                return
+            time.sleep(1)
+        raise RuntimeError("Edge did not open the remote debugging port.")
+
+    def connect(self):
+        self.ensure_debug_browser()
+        options = Options()
+        options.debugger_address = f"127.0.0.1:{self.config.debug_port}"
+        driver = webdriver.Edge(options=options)
+        if "prenotazionicie.interno.gov.it" not in driver.current_url:
+            driver.get(self.config.start_url)
+        self.driver = driver
+        return driver
+
+    def close(self):
+        if not self.driver:
+            return
+        try:
+            self.driver.quit()
+        except WebDriverException as exc:
+            log(f"Driver shutdown failed: {exc}")
+        finally:
+            self.driver = None
 
 
-def build_driver():
-    launch_edge_for_attach()
-    options = Options()
-    options.debugger_address = f"127.0.0.1:{DEBUG_PORT}"
-    driver = webdriver.Edge(options=options)
-    if "prenotazionicie.interno.gov.it" not in driver.current_url:
-        driver.get(START_URL)
-    return driver
+def build_driver(session):
+    return session.connect()
 
 
 SCRAPE_SCRIPT = r"""
@@ -228,13 +306,14 @@ def matching_rows(scan, start_date, end_date):
 
 
 class WatcherWorker:
-    def __init__(self, start_date, end_date, events):
+    def __init__(self, start_date, end_date, events, config):
         self.start_date = start_date
         self.end_date = end_date
         self.events = events
+        self.config = config
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
-        self.driver = None
+        self.session = EdgeSession(config)
         self.seen = set()
 
     def start(self):
@@ -249,51 +328,58 @@ class WatcherWorker:
     def run(self):
         self.emit("status", "Starting Edge. Log in manually, enter details, then stop on Scegli la sede.")
         try:
-            self.driver = build_driver()
+            driver = build_driver(self.session)
         except Exception as exc:
             self.emit("error", f"Could not start Edge/Selenium: {exc}")
             return
 
-        while not self.stop_event.is_set():
-            try:
-                scan = scan_page(self.driver)
-            except (JavascriptException, WebDriverException) as exc:
-                self.emit("log", f"Could not scan page: {exc}")
-                scan = {"ok": False, "reason": str(exc), "rows": []}
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    scan = scan_page(driver)
+                except JavascriptException as exc:
+                    self.emit("log", f"Could not scan page: {exc}")
+                    scan = {"ok": False, "reason": str(exc), "rows": []}
+                except WebDriverException as exc:
+                    self.emit("error", f"Browser session failed: {exc}")
+                    break
 
-            if not scan.get("ok"):
-                self.emit("status", scan.get("reason", "Waiting for Scegli la sede page."))
-            else:
-                matches = matching_rows(scan, self.start_date, self.end_date)
-                if not matches:
-                    self.emit("log", "Scanned table: no selectable date in selected range.")
-                for match in matches:
-                    key = f"{match['date'].isoformat()}|{match['details']}"
-                    if key in self.seen:
-                        continue
-                    self.seen.add(key)
-                    message = (
-                        f"Selectable appointment: {match['date']:%d/%m/%Y}\n"
-                        f"{match['scope']}\n{match['details']}"
-                    )
-                    log(f"NOTIFICATION: {message.replace(chr(10), ' | ')}")
-                    desktop_flash("Carta identita appointment found", message)
-                    self.emit("match", message, match)
+                if not scan.get("ok"):
+                    self.emit("status", scan.get("reason", "Waiting for Scegli la sede page."))
+                else:
+                    matches = matching_rows(scan, self.start_date, self.end_date)
+                    if not matches:
+                        self.emit("log", "Scanned table: no selectable date in selected range.")
+                    for match in matches:
+                        key = f"{match['date'].isoformat()}|{match['details']}"
+                        if key in self.seen:
+                            continue
+                        self.seen.add(key)
+                        message = (
+                            f"Selectable appointment: {match['date']:%d/%m/%Y}\n"
+                            f"{match['scope']}\n{match['details']}"
+                        )
+                        log(f"NOTIFICATION: {message.replace(chr(10), ' | ')}")
+                        desktop_flash("Carta identita appointment found", message)
+                        self.emit("match", message, match)
 
-            if self.stop_event.wait(CHECK_INTERVAL_SECONDS):
-                break
-            try:
-                if "/wizardAppuntamentoCittadino/sceltaSede" in self.driver.current_url:
-                    self.driver.refresh()
-                    time.sleep(5)
-            except WebDriverException as exc:
-                self.emit("log", f"Refresh failed: {exc}")
-
-        self.emit("status", "Stopped.")
+                if self.stop_event.wait(self.config.check_interval_seconds):
+                    break
+                try:
+                    if TARGET_PATH_FRAGMENT in driver.current_url:
+                        driver.refresh()
+                        time.sleep(5)
+                except WebDriverException as exc:
+                    self.emit("error", f"Refresh failed: {exc}")
+                    break
+        finally:
+            self.session.close()
+            self.emit("status", "Stopped.")
 
 
 class AppointmentWatcherGui:
     def __init__(self, root):
+        self.config = RuntimeConfig.load()
         self.root = root
         self.root.title("Agenda CIE Appointment Watcher")
         self.root.geometry("760x520")
@@ -303,7 +389,7 @@ class AppointmentWatcherGui:
         self.worker = None
 
         today = dt.date.today()
-        default_end = dt.date(2026, 6, 14)
+        default_end = today + dt.timedelta(days=21)
 
         self.start_var = tk.StringVar(value=today.strftime("%d/%m/%Y"))
         self.end_var = tk.StringVar(value=default_end.strftime("%d/%m/%Y"))
@@ -372,6 +458,9 @@ class AppointmentWatcherGui:
         self.log_box.configure(state="disabled")
 
     def start_watcher(self):
+        if self.worker and self.worker.thread.is_alive():
+            messagebox.showinfo("Watcher running", "The watcher is already running.")
+            return
         try:
             start_date = parse_user_date(self.start_var.get())
             end_date = parse_user_date(self.end_var.get())
@@ -382,7 +471,9 @@ class AppointmentWatcherGui:
             messagebox.showerror("Invalid range", "The start date must be before or equal to the end date.")
             return
 
-        self.worker = WatcherWorker(start_date, end_date, self.events)
+        self.alert_text.configure(text="No appointment found yet.", bg="#fff3cd", fg="#5c4400")
+        self.alert_frame.configure(bg="#fff3cd", highlightbackground="#f0c36d")
+        self.worker = WatcherWorker(start_date, end_date, self.events, self.config)
         self.worker.start()
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
@@ -413,11 +504,18 @@ class AppointmentWatcherGui:
                 self.add_log(message)
                 self.start_button.configure(state="normal")
                 self.stop_button.configure(state="disabled")
+                self.worker = None
             elif kind == "match":
                 self.status_var.set("Appointment found.")
                 self.alert_text.configure(text=message, bg="#d1e7dd", fg="#0f5132")
                 self.alert_frame.configure(bg="#d1e7dd", highlightbackground="#75b798")
                 self.add_log(message)
+                continue
+
+            if kind == "status" and message == "Stopped.":
+                self.start_button.configure(state="normal")
+                self.stop_button.configure(state="disabled")
+                self.worker = None
 
         self.root.after(200, self.process_events)
 
