@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agenda-cie-appointment-watcher"
+version = "0.1.0"
+description = "Local Selenium watcher for Agenda CIE appointment availability at the Scegli la sede step."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "selenium>=4.44.0",
+]
+
+[project.scripts]
+cie-appointment-watcher = "selenium_takeover:main"
+
+[tool.setuptools]
+py-modules = ["selenium_takeover"]
